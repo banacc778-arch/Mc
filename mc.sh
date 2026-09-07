@@ -671,4 +671,108 @@ cat > templates/index.html <<'HTML'
         input.value = '';
         setTimeout(loadLogs, 400);
       } catch (err) {
-        toast('L
+        toast('Lỗi: ' + err.message);
+      }
+      return false;
+    }
+
+    function copyText(id) {
+      const text = document.getElementById(id).textContent;
+      navigator.clipboard.writeText(text).then(() => toast('Đã copy: ' + text));
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const j = await res.json();
+
+        const badge = document.getElementById('statusBadge');
+        if (j.running) {
+          badge.textContent = '● Online';
+          badge.className = 'status-badge online';
+        } else {
+          badge.textContent = '● Offline';
+          badge.className = 'status-badge offline';
+        }
+
+        document.getElementById('pidInfo').textContent = j.pid ? `PID: ${j.pid}` : 'PID: —';
+
+        document.getElementById('cpuText').textContent = j.stats.cpu + '%';
+        document.getElementById('cpuBar').style.width = j.stats.cpu + '%';
+
+        document.getElementById('ramText').textContent = `${j.stats.ram_used} / ${j.stats.ram_total} GB`;
+        document.getElementById('ramBar').style.width = j.stats.ram_percent + '%';
+
+        document.getElementById('diskText').textContent = `${j.stats.disk_used} / ${j.stats.disk_total} GB`;
+        document.getElementById('diskBar').style.width = j.stats.disk_percent + '%';
+
+        document.getElementById('javaAddr').textContent = j.java_address;
+        document.getElementById('bedrockAddr').textContent = j.bedrock_address;
+        document.getElementById('updateTime').textContent = j.time;
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function loadLogs() {
+      try {
+        const res = await fetch('/api/logs?lines=300');
+        const j = await res.json();
+        const el = document.getElementById('log');
+        el.textContent = j.logs || '';
+        el.scrollTop = el.scrollHeight;
+      } catch (e) {}
+    }
+
+    refreshStatus();
+    loadLogs();
+    setInterval(refreshStatus, 4000);
+    setInterval(loadLogs, 3500);
+  </script>
+</body>
+</html>
+HTML
+
+# Cài package
+echo "Cài Python packages..."
+pip3 install --upgrade pip >/dev/null 2>&1 || true
+pip3 install -r requirements.txt --no-cache-dir
+
+# Biến môi trường
+export RCON_PASS="${RCON_PASS}"
+export RCON_HOST="127.0.0.1"
+export RCON_PORT="${RCON_PORT}"
+export ADMIN_USER="${ADMIN_USER}"
+export ADMIN_PASS="${ADMIN_PASS}"
+export WEB_BIND="${WEB_BIND}"
+export WEB_PORT="${WEB_PORT}"
+export MC_PORT="${MC_PORT}"
+export BEDROCK_PORT="${BEDROCK_PORT}"
+
+echo "Khởi động Minecraft server..."
+nohup bash ./run.sh > /dev/null 2>&1 &
+echo $! > mcserver.pid
+sleep 2
+
+echo "Khởi động Web UI..."
+nohup python3 webui.py > webui.log 2>&1 &
+echo $! > webui.pid
+
+IP_ADDR=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+
+echo ""
+echo "=============================================="
+echo "  HOÀN TẤT THIẾT LẬP (không dùng psutil)"
+echo "=============================================="
+echo "Minecraft Java   : ${IP_ADDR}:${MC_PORT}"
+echo "Minecraft Bedrock: ${IP_ADDR}:${BEDROCK_PORT}"
+echo ""
+echo "Web UI           : http://${IP_ADDR}:${WEB_PORT}"
+echo "Tài khoản Web    : ${ADMIN_USER}"
+echo "Mật khẩu Web     : ${ADMIN_PASS}"
+echo ""
+echo "RCON Password    : ${RCON_PASS}"
+echo "=============================================="
+echo "Logs server : $MC_DIR/logs/latest.log"
+echo "Logs webui  : $MC_DIR/webui.log"
+echo "=============================================="
