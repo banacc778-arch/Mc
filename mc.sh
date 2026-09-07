@@ -1,30 +1,28 @@
 #!/bin/bash
 set -euo pipefail
 
-# ---- Config (chỉnh nếu muốn trước khi chạy) ----
+# ---- Config ----
 MC_DIR="$HOME/mc-server"
 JAVA_MIN=1024M
 JAVA_MAX=1536M
 MC_PORT=25565
 BEDROCK_PORT=19132
 RCON_PORT=25575
-WEB_BIND="0.0.0.0"    # đổi thành 127.0.0.1 nếu chỉ muốn truy cập cục bộ
+WEB_BIND="0.0.0.0"
 WEB_PORT=8080
-# -------------------------------------------------
+# ----------------
 
-echo "Bắt đầu thiết lập Minecraft server + Web UI đẹp trong: $MC_DIR"
+echo "Bắt đầu thiết lập Minecraft server + Web UI (không dùng psutil)..."
 
-# Termux storage permission
 termux-setup-storage || true
 
-# Cài cơ bản
 pkg update -y && pkg upgrade -y
 pkg install -y wget openjdk-25 curl python
 
 mkdir -p "$MC_DIR"
 cd "$MC_DIR"
 
-# Tạo run script
+# run.sh
 cat > run.sh <<'SH'
 #!/bin/bash
 set -e
@@ -36,14 +34,12 @@ exec java -Xmx${JAVA_MAX} -Xms${JAVA_MIN} -jar server.jar nogui >> logs/latest.l
 SH
 chmod +x run.sh
 
-# Tải server.jar (Purpur)
 echo "Tải server.jar..."
 wget -O server.jar https://api.purpurmc.org/v2/purpur/26.2/latest/download
 
 mkdir -p plugins
 
-# Tải plugin
-echo "Tải Geyser, Floodgate, ViaVersion, ViaBackwards..."
+echo "Tải plugins..."
 wget -q -O plugins/Geyser-Spigot.jar https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot || true
 wget -q -O plugins/Floodgate-Spigot.jar https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot || true
 
@@ -53,10 +49,8 @@ VV_URL=$(curl -s https://api.github.com/repos/ViaVersion/ViaVersion/releases/lat
 VB_URL=$(curl -s https://api.github.com/repos/ViaVersion/ViaBackwards/releases/latest | grep "browser_download_url" | grep -v "fabric\|sources\|javadoc" | grep '\.jar"' | cut -d '"' -f4 | head -n1 || true)
 [ -n "$VB_URL" ] && wget -q -O plugins/ViaBackwards.jar "$VB_URL" || true
 
-# EULA
 echo "eula=true" > eula.txt
 
-# Sinh mật khẩu
 generate_pass() {
   tr -dc 'A-Za-z0-9_!@#%&' < /dev/urandom | head -c 20 || echo "changeme12345"
 }
@@ -64,7 +58,6 @@ RCON_PASS=$(generate_pass)
 ADMIN_USER="admin"
 ADMIN_PASS=$(generate_pass)
 
-# server.properties
 cat > server.properties <<EOF
 online-mode=false
 server-port=${MC_PORT}
@@ -81,7 +74,6 @@ rcon.port=${RCON_PORT}
 rcon.password=${RCON_PASS}
 EOF
 
-# Geyser + Floodgate config cơ bản
 mkdir -p plugins/Geyser-Spigot plugins/floodgate
 cat > plugins/Geyser-Spigot/config.yml <<'YML'
 bedrock:
@@ -99,21 +91,19 @@ YML
 
 mkdir -p logs templates static
 
-# ---------------- requirements ----------------
+# requirements (KHÔNG còn psutil)
 cat > requirements.txt <<'REQ'
 flask
 mcrcon
-psutil
 REQ
 
-# ---------------- webui.py (nâng cấp mạnh) ----------------
+# ==================== webui.py (đã sửa) ====================
 cat > webui.py <<'PY'
 #!/usr/bin/env python3
 import os
-import signal
 import subprocess
 import time
-import psutil
+import signal
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify
 from functools import wraps
@@ -125,7 +115,6 @@ except Exception:
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
-# Config từ môi trường
 MC_DIR = os.getcwd()
 RCON_HOST = os.environ.get("RCON_HOST", "127.0.0.1")
 RCON_PORT = int(os.environ.get("RCON_PORT", 25575))
@@ -174,16 +163,12 @@ def is_server_running():
     try:
         with open(PID_FILE) as f:
             pid = int(f.read().strip())
-        if psutil.pid_exists(pid):
-            p = psutil.Process(pid)
-            # Kiểm tra xem có phải java server.jar không
-            cmdline = " ".join(p.cmdline()).lower()
-            if "server.jar" in cmdline or "java" in cmdline:
-                return True, pid
-        # PID chết → xóa file
-        os.remove(PID_FILE)
-        return False, None
-    except Exception:
+        # Kiểm tra process còn sống không
+        os.kill(pid, 0)
+        return True, pid
+    except (OSError, ValueError):
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
         return False, None
 
 def start_server():
@@ -191,7 +176,6 @@ def start_server():
     if running:
         return False, "Server đang chạy rồi"
     try:
-        # Xóa log cũ nếu muốn (tùy chọn)
         proc = subprocess.Popen(
             ["bash", "run.sh"],
             cwd=MC_DIR,
@@ -211,12 +195,13 @@ def stop_server():
     if not running:
         return False, "Server không chạy"
     try:
-        p = psutil.Process(pid)
-        p.terminate()
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(2)
         try:
-            p.wait(timeout=8)
-        except psutil.TimeoutExpired:
-            p.kill()
+            os.kill(pid, 0)  # còn sống?
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
         if os.path.exists(PID_FILE):
             os.remove(PID_FILE)
         return True, "Đã tắt server"
@@ -224,18 +209,57 @@ def stop_server():
         return False, str(e)
 
 def get_system_stats():
-    cpu = psutil.cpu_percent(interval=0.3)
-    mem = psutil.virtual_memory()
-    disk = psutil.disk_usage(MC_DIR)
-    return {
-        "cpu": round(cpu, 1),
-        "ram_used": round(mem.used / (1024**3), 2),
-        "ram_total": round(mem.total / (1024**3), 2),
-        "ram_percent": mem.percent,
-        "disk_used": round(disk.used / (1024**3), 2),
-        "disk_total": round(disk.total / (1024**3), 2),
-        "disk_percent": disk.percent,
+    """Lấy CPU / RAM / Disk bằng lệnh hệ thống (tương thích Termux)"""
+    stats = {
+        "cpu": 0.0,
+        "ram_used": 0.0,
+        "ram_total": 0.0,
+        "ram_percent": 0.0,
+        "disk_used": 0.0,
+        "disk_total": 0.0,
+        "disk_percent": 0.0,
     }
+    try:
+        # RAM
+        out = subprocess.check_output(["free", "-m"], text=True)
+        for line in out.splitlines():
+            if line.startswith("Mem:"):
+                parts = line.split()
+                total = float(parts[1])
+                used = float(parts[2])
+                stats["ram_total"] = round(total / 1024, 2)
+                stats["ram_used"] = round(used / 1024, 2)
+                stats["ram_percent"] = round((used / total) * 100, 1) if total > 0 else 0
+                break
+    except Exception:
+        pass
+
+    try:
+        # Disk
+        out = subprocess.check_output(["df", "-B1", "."], text=True)
+        lines = out.strip().splitlines()
+        if len(lines) >= 2:
+            parts = lines[1].split()
+            total = float(parts[1])
+            used = float(parts[2])
+            stats["disk_total"] = round(total / (1024**3), 2)
+            stats["disk_used"] = round(used / (1024**3), 2)
+            stats["disk_percent"] = round((used / total) * 100, 1) if total > 0 else 0
+    except Exception:
+        pass
+
+    try:
+        # CPU (dùng load average 1 phút * số core gần đúng)
+        with open("/proc/loadavg") as f:
+            load1 = float(f.read().split()[0])
+        # Ước lượng % (load1 / số core * 100), giới hạn 100
+        cores = os.cpu_count() or 4
+        cpu = min(100.0, round((load1 / cores) * 100, 1))
+        stats["cpu"] = cpu
+    except Exception:
+        stats["cpu"] = 0.0
+
+    return stats
 
 @app.route("/")
 def index():
@@ -284,14 +308,13 @@ def api_restart():
 @app.route("/api/reset", methods=["POST"])
 @require_auth
 def api_reset():
-    """Tắt server + xóa world + khởi động lại"""
     stop_server()
     time.sleep(1.5)
     try:
+        import shutil
         for name in ["world", "world_nether", "world_the_end"]:
             path = os.path.join(MC_DIR, name)
             if os.path.exists(path):
-                import shutil
                 shutil.rmtree(path)
         ok, msg = start_server()
         return jsonify({"success": ok, "message": "Đã reset world + " + msg})
@@ -342,7 +365,7 @@ if __name__ == "__main__":
     app.run(host=WEB_BIND, port=WEB_PORT, debug=False)
 PY
 
-# ---------------- templates/index.html (giao diện đẹp) ----------------
+# ==================== templates/index.html ====================
 cat > templates/index.html <<'HTML'
 <!DOCTYPE html>
 <html lang="vi">
@@ -361,7 +384,6 @@ cat > templates/index.html <<'HTML'
       --accent-dim: #22c55e;
       --danger: #f87171;
       --warning: #fbbf24;
-      --blue: #60a5fa;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -381,13 +403,7 @@ cat > templates/index.html <<'HTML'
       flex-wrap: wrap;
       gap: 12px;
     }
-    h1 {
-      font-size: 1.5rem;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
+    h1 { font-size: 1.5rem; font-weight: 700; display: flex; align-items: center; gap: 10px; }
     .status-badge {
       font-size: 0.85rem;
       padding: 4px 12px;
@@ -418,7 +434,6 @@ cat > templates/index.html <<'HTML'
       letter-spacing: 0.5px;
     }
 
-    /* Buttons */
     .btn-group { display: flex; flex-wrap: wrap; gap: 8px; }
     button {
       border: none;
@@ -436,17 +451,10 @@ cat > templates/index.html <<'HTML'
     .btn-start { background: var(--accent); color: #052e16; }
     .btn-start:hover { background: var(--accent-dim); }
     .btn-stop { background: var(--danger); color: #450a0a; }
-    .btn-stop:hover { filter: brightness(1.1); }
     .btn-restart { background: var(--warning); color: #422006; }
     .btn-reset { background: #a78bfa; color: #2e1065; }
-    .btn-secondary {
-      background: #27272a;
-      color: var(--text);
-      border: 1px solid var(--border);
-    }
-    .btn-secondary:hover { background: #3f3f46; }
+    .btn-secondary { background: #27272a; color: var(--text); border: 1px solid var(--border); }
 
-    /* Stats */
     .stat-row {
       display: flex;
       justify-content: space-between;
@@ -469,7 +477,6 @@ cat > templates/index.html <<'HTML'
     .bar-ram { background: linear-gradient(90deg, #4ade80, #22c55e); }
     .bar-disk { background: linear-gradient(90deg, #fbbf24, #f59e0b); }
 
-    /* Connection info */
     .addr-box {
       background: #0f0f12;
       border: 1px solid var(--border);
@@ -494,7 +501,6 @@ cat > templates/index.html <<'HTML'
       white-space: nowrap;
     }
 
-    /* Console */
     .console-card { grid-column: 1 / -1; }
     #log {
       background: #0a0a0c;
@@ -503,7 +509,7 @@ cat > templates/index.html <<'HTML'
       height: 320px;
       overflow-y: auto;
       padding: 12px;
-      font-family: ui-monospace, 'Cascadia Code', monospace;
+      font-family: ui-monospace, monospace;
       font-size: 0.82rem;
       line-height: 1.45;
       white-space: pre-wrap;
@@ -566,7 +572,6 @@ cat > templates/index.html <<'HTML'
     </header>
 
     <div class="grid">
-      <!-- Control -->
       <div class="card">
         <h3>Điều khiển Server</h3>
         <div class="btn-group">
@@ -578,29 +583,18 @@ cat > templates/index.html <<'HTML'
         <p style="margin-top:14px;font-size:0.85rem;color:var(--muted)" id="pidInfo">PID: —</p>
       </div>
 
-      <!-- Resources -->
       <div class="card">
         <h3>Tài nguyên hệ thống</h3>
-        <div class="stat-row">
-          <span>CPU</span>
-          <span id="cpuText">—%</span>
-        </div>
+        <div class="stat-row"><span>CPU</span><span id="cpuText">—%</span></div>
         <div class="progress"><div class="progress-bar bar-cpu" id="cpuBar" style="width:0%"></div></div>
 
-        <div class="stat-row">
-          <span>RAM</span>
-          <span id="ramText">— / — GB</span>
-        </div>
+        <div class="stat-row"><span>RAM</span><span id="ramText">— / — GB</span></div>
         <div class="progress"><div class="progress-bar bar-ram" id="ramBar" style="width:0%"></div></div>
 
-        <div class="stat-row">
-          <span>Disk (ROM)</span>
-          <span id="diskText">— / — GB</span>
-        </div>
+        <div class="stat-row"><span>Disk (ROM)</span><span id="diskText">— / — GB</span></div>
         <div class="progress"><div class="progress-bar bar-disk" id="diskBar" style="width:0%"></div></div>
       </div>
 
-      <!-- Connection -->
       <div class="card">
         <h3>Địa chỉ kết nối</h3>
         <div class="addr-box">
@@ -620,7 +614,6 @@ cat > templates/index.html <<'HTML'
       </div>
     </div>
 
-    <!-- Console -->
     <div class="card console-card">
       <h3>Console / Log</h3>
       <div id="log">Đang tải log...</div>
@@ -678,116 +671,4 @@ cat > templates/index.html <<'HTML'
         input.value = '';
         setTimeout(loadLogs, 400);
       } catch (err) {
-        toast('Lỗi: ' + err.message);
-      }
-      return false;
-    }
-
-    function copyText(id) {
-      const text = document.getElementById(id).textContent;
-      navigator.clipboard.writeText(text).then(() => toast('Đã copy: ' + text));
-    }
-
-    async function refreshStatus() {
-      try {
-        const res = await fetch('/api/status');
-        const j = await res.json();
-
-        // Status badge
-        const badge = document.getElementById('statusBadge');
-        if (j.running) {
-          badge.textContent = '● Online';
-          badge.className = 'status-badge online';
-        } else {
-          badge.textContent = '● Offline';
-          badge.className = 'status-badge offline';
-        }
-
-        document.getElementById('pidInfo').textContent = j.pid ? `PID: ${j.pid}` : 'PID: —';
-
-        // Stats
-        document.getElementById('cpuText').textContent = j.stats.cpu + '%';
-        document.getElementById('cpuBar').style.width = j.stats.cpu + '%';
-
-        document.getElementById('ramText').textContent = `${j.stats.ram_used} / ${j.stats.ram_total} GB`;
-        document.getElementById('ramBar').style.width = j.stats.ram_percent + '%';
-
-        document.getElementById('diskText').textContent = `${j.stats.disk_used} / ${j.stats.disk_total} GB`;
-        document.getElementById('diskBar').style.width = j.stats.disk_percent + '%';
-
-        // Addresses
-        document.getElementById('javaAddr').textContent = j.java_address;
-        document.getElementById('bedrockAddr').textContent = j.bedrock_address;
-
-        document.getElementById('updateTime').textContent = j.time;
-      } catch (e) {
-        console.error(e);
-      }
-    }
-
-    async function loadLogs() {
-      try {
-        const res = await fetch('/api/logs?lines=300');
-        const j = await res.json();
-        const el = document.getElementById('log');
-        el.textContent = j.logs || '';
-        el.scrollTop = el.scrollHeight;
-      } catch (e) {}
-    }
-
-    // Auto refresh
-    refreshStatus();
-    loadLogs();
-    setInterval(refreshStatus, 4000);
-    setInterval(loadLogs, 3500);
-  </script>
-</body>
-</html>
-HTML
-
-# Cài Python packages
-echo "Cài Python packages..."
-pip3 install --upgrade pip >/dev/null 2>&1 || true
-pip3 install -r requirements.txt --no-cache-dir
-
-# Xuất biến môi trường
-export RCON_PASS="${RCON_PASS}"
-export RCON_HOST="127.0.0.1"
-export RCON_PORT="${RCON_PORT}"
-export ADMIN_USER="${ADMIN_USER}"
-export ADMIN_PASS="${ADMIN_PASS}"
-export WEB_BIND="${WEB_BIND}"
-export WEB_PORT="${WEB_PORT}"
-export MC_PORT="${MC_PORT}"
-export BEDROCK_PORT="${BEDROCK_PORT}"
-
-# Khởi động server + webui
-echo "Khởi động Minecraft server..."
-nohup bash ./run.sh > /dev/null 2>&1 &
-echo $! > mcserver.pid
-sleep 2
-
-echo "Khởi động Web UI..."
-nohup python3 webui.py > webui.log 2>&1 &
-echo $! > webui.pid
-
-IP_ADDR=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
-
-echo ""
-echo "=============================================="
-echo "  HOÀN TẤT THIẾT LẬP"
-echo "=============================================="
-echo "Minecraft Java   : ${IP_ADDR}:${MC_PORT}"
-echo "Minecraft Bedrock: ${IP_ADDR}:${BEDROCK_PORT}"
-echo ""
-echo "Web UI           : http://${IP_ADDR}:${WEB_PORT}"
-echo "Tài khoản Web    : ${ADMIN_USER}"
-echo "Mật khẩu Web     : ${ADMIN_PASS}"
-echo ""
-echo "RCON Password    : ${RCON_PASS}"
-echo "=============================================="
-echo "Logs server : $MC_DIR/logs/latest.log"
-echo "Logs webui  : $MC_DIR/webui.log"
-echo "Dừng server : kill \$(cat $MC_DIR/mcserver.pid)"
-echo "Dừng webui  : kill \$(cat $MC_DIR/webui.pid)"
-echo "=============================================="
+        toast('L
