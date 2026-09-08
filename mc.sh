@@ -10,7 +10,7 @@ RCON_PORT=25575
 WEB_BIND="0.0.0.0"
 WEB_PORT=8080
 
-echo "==> Bắt đầu cài Minecraft Server + Web UI nâng cao..."
+echo "==> Đang cài Minecraft Server + Web UI (Session Login)..."
 
 termux-setup-storage || true
 pkg update -y && pkg upgrade -y
@@ -35,7 +35,6 @@ echo "==> Tải server.jar..."
 wget -q -O server.jar https://api.purpurmc.org/v2/purpur/26.2/latest/download
 
 mkdir -p plugins
-echo "==> Tải plugins..."
 wget -q -O plugins/Geyser-Spigot.jar https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot || true
 wget -q -O plugins/Floodgate-Spigot.jar https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot || true
 
@@ -47,7 +46,7 @@ VB_URL=$(curl -s https://api.github.com/repos/ViaVersion/ViaBackwards/releases/l
 echo "eula=true" > eula.txt
 
 generate_pass() {
-  tr -dc 'A-Za-z0-9_!@#%&' < /dev/urandom | head -c 18 || echo "McAdmin@2026"
+  tr -dc 'A-Za-z0-9_!@#%&' < /dev/urandom | head -c 16 || echo "McAdmin2026"
 }
 RCON_PASS=$(generate_pass)
 ADMIN_USER="admin"
@@ -91,10 +90,11 @@ REQ
 # ====================== webui.py ======================
 cat > webui.py << 'PY'
 #!/usr/bin/env python3
-import os, subprocess, time, signal, shutil, json
-from datetime import datetime
+import os, subprocess, time, signal, shutil, secrets
+from datetime import datetime, timedelta
 from functools import wraps
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask import (Flask, render_template, request, jsonify, 
+                   session, redirect, url_for, flash)
 from werkzeug.utils import secure_filename
 
 try:
@@ -103,6 +103,9 @@ except:
     raise SystemExit("pip3 install -r requirements.txt")
 
 app = Flask(__name__, template_folder="templates")
+app.secret_key = secrets.token_hex(32)          # random mỗi lần chạy
+app.permanent_session_lifetime = timedelta(days=30)  # nhớ 30 ngày
+
 MC_DIR = os.getcwd()
 RCON_HOST = "127.0.0.1"
 RCON_PORT = int(os.environ.get("RCON_PORT", 25575))
@@ -116,19 +119,11 @@ WEB_PORT = int(os.environ.get("WEB_PORT", 8080))
 MC_PORT = int(os.environ.get("MC_PORT", 25565))
 BEDROCK_PORT = int(os.environ.get("BEDROCK_PORT", 19132))
 
-ALLOWED_EXTENSIONS = None  # cho phép mọi file
-
-def check_auth():
-    if not ADMIN_USER or not ADMIN_PASS:
-        return True
-    auth = request.authorization
-    return auth and auth.username == ADMIN_USER and auth.password == ADMIN_PASS
-
-def require_auth(f):
+def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if not check_auth():
-            return jsonify({"error": "unauthorized"}), 401
+        if not session.get("logged_in"):
+            return redirect(url_for("login"))
         return f(*args, **kwargs)
     return decorated
 
@@ -156,7 +151,8 @@ def is_running():
         return True, pid
     except:
         if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
+            try: os.remove(PID_FILE)
+            except: pass
         return False, None
 
 def start_server():
@@ -183,8 +179,7 @@ def stop_server():
         try:
             os.kill(pid, 0)
             os.kill(pid, signal.SIGKILL)
-        except:
-            pass
+        except: pass
         if os.path.exists(PID_FILE):
             os.remove(PID_FILE)
         return True, "Đã tắt server"
@@ -230,20 +225,41 @@ def rcon_cmd(cmd):
         return f"Lỗi RCON: {e}"
 
 def safe_path(path):
-    """Chống path traversal"""
     full = os.path.abspath(os.path.join(MC_DIR, path))
     if not full.startswith(os.path.abspath(MC_DIR)):
         return None
     return full
 
+# ========== AUTH ==========
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("logged_in"):
+        return redirect(url_for("index"))
+    error = None
+    if request.method == "POST":
+        user = request.form.get("username", "")
+        pw = request.form.get("password", "")
+        if user == ADMIN_USER and pw == ADMIN_PASS:
+            session.permanent = True
+            session["logged_in"] = True
+            return redirect(url_for("index"))
+        else:
+            error = "Sai tài khoản hoặc mật khẩu"
+    return render_template("login.html", error=error)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
 @app.route("/")
+@login_required
 def index():
-    if not check_auth():
-        return ("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="MC Control"'})
     return render_template("index.html")
 
+# ========== API ==========
 @app.route("/api/status")
-@require_auth
+@login_required
 def api_status():
     running, pid = is_running()
     ip = get_local_ip()
@@ -256,19 +272,19 @@ def api_status():
     })
 
 @app.route("/api/start", methods=["POST"])
-@require_auth
+@login_required
 def api_start():
     ok, msg = start_server()
     return jsonify({"success": ok, "message": msg})
 
 @app.route("/api/stop", methods=["POST"])
-@require_auth
+@login_required
 def api_stop():
     ok, msg = stop_server()
     return jsonify({"success": ok, "message": msg})
 
 @app.route("/api/restart", methods=["POST"])
-@require_auth
+@login_required
 def api_restart():
     stop_server()
     time.sleep(2)
@@ -276,7 +292,7 @@ def api_restart():
     return jsonify({"success": ok, "message": "Restart: " + msg})
 
 @app.route("/api/reset", methods=["POST"])
-@require_auth
+@login_required
 def api_reset():
     stop_server()
     time.sleep(1)
@@ -291,7 +307,7 @@ def api_reset():
         return jsonify({"success": False, "message": str(e)})
 
 @app.route("/api/cmd", methods=["POST"])
-@require_auth
+@login_required
 def api_cmd():
     data = request.get_json() or {}
     cmd = data.get("command", "").strip()
@@ -300,60 +316,52 @@ def api_cmd():
     return jsonify({"response": rcon_cmd(cmd)})
 
 @app.route("/api/players")
-@require_auth
+@login_required
 def api_players():
     resp = rcon_cmd("list")
-    # Ví dụ: "There are 2 of a max of 20 players online: Steve, Alex"
     players = []
     count = 0
-    if "players online:" in resp.lower() or "of a max" in resp.lower():
-        try:
-            if ":" in resp:
-                names = resp.split(":")[-1].strip()
-                if names and names.lower() not in ["", "none"]:
-                    players = [n.strip() for n in names.split(",") if n.strip()]
-                    count = len(players)
-        except:
-            pass
+    try:
+        if ":" in resp:
+            names = resp.split(":")[-1].strip()
+            if names and names.lower() not in ["", "none"]:
+                players = [n.strip() for n in names.split(",") if n.strip()]
+                count = len(players)
+    except: pass
     return jsonify({"count": count, "players": players, "raw": resp})
 
 @app.route("/api/op", methods=["POST"])
-@require_auth
+@login_required
 def api_op():
     data = request.get_json() or {}
     name = data.get("player", "").strip()
-    if not name:
-        return jsonify({"error": "Thiếu tên"}), 400
+    if not name: return jsonify({"error": "Thiếu tên"}), 400
     return jsonify({"response": rcon_cmd(f"op {name}")})
 
 @app.route("/api/deop", methods=["POST"])
-@require_auth
+@login_required
 def api_deop():
     data = request.get_json() or {}
     name = data.get("player", "").strip()
-    if not name:
-        return jsonify({"error": "Thiếu tên"}), 400
+    if not name: return jsonify({"error": "Thiếu tên"}), 400
     return jsonify({"response": rcon_cmd(f"deop {name}")})
 
 @app.route("/api/maxplayers", methods=["POST"])
-@require_auth
+@login_required
 def api_maxplayers():
     data = request.get_json() or {}
     try:
         num = int(data.get("max", 20))
         if num < 1 or num > 200:
-            return jsonify({"error": "Số không hợp lệ (1-200)"}), 400
+            return jsonify({"error": "1-200 thôi"}), 400
     except:
         return jsonify({"error": "Số không hợp lệ"}), 400
 
-    # Sửa server.properties
     props = os.path.join(MC_DIR, "server.properties")
     lines = []
     if os.path.exists(props):
-        with open(props) as f:
-            lines = f.readlines()
-    new_lines = []
-    found = False
+        with open(props) as f: lines = f.readlines()
+    new_lines, found = [], False
     for line in lines:
         if line.startswith("max-players="):
             new_lines.append(f"max-players={num}\n")
@@ -362,17 +370,15 @@ def api_maxplayers():
             new_lines.append(line)
     if not found:
         new_lines.append(f"max-players={num}\n")
-    with open(props, "w") as f:
-        f.writelines(new_lines)
+    with open(props, "w") as f: f.writelines(new_lines)
 
-    # Restart để áp dụng
     stop_server()
     time.sleep(1.5)
     ok, msg = start_server()
     return jsonify({"success": True, "message": f"Đã đặt max-players={num} và restart"})
 
 @app.route("/api/logs")
-@require_auth
+@login_required
 def api_logs():
     lines = int(request.args.get("lines", 250))
     try:
@@ -394,15 +400,12 @@ def api_logs():
 
 # ========== FILE MANAGER ==========
 @app.route("/api/files")
-@require_auth
+@login_required
 def api_files():
     rel = request.args.get("path", "").strip("/")
     full = safe_path(rel)
-    if full is None or not os.path.exists(full):
+    if full is None or not os.path.isdir(full):
         return jsonify({"error": "Đường dẫn không hợp lệ"}), 400
-    if not os.path.isdir(full):
-        return jsonify({"error": "Không phải thư mục"}), 400
-
     items = []
     try:
         for name in sorted(os.listdir(full)):
@@ -418,15 +421,14 @@ def api_files():
     return jsonify({"path": rel, "items": items})
 
 @app.route("/api/file/read")
-@require_auth
+@login_required
 def api_file_read():
     rel = request.args.get("path", "").strip("/")
     full = safe_path(rel)
     if full is None or not os.path.isfile(full):
         return jsonify({"error": "File không tồn tại"}), 400
     try:
-        # Giới hạn file text < 2MB
-        if os.path.getsize(full) > 2 * 1024 * 1024:
+        if os.path.getsize(full) > 2*1024*1024:
             return jsonify({"error": "File quá lớn (>2MB)"}), 400
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
@@ -435,7 +437,7 @@ def api_file_read():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/file/save", methods=["POST"])
-@require_auth
+@login_required
 def api_file_save():
     data = request.get_json() or {}
     rel = data.get("path", "").strip("/")
@@ -452,7 +454,7 @@ def api_file_save():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/file/delete", methods=["POST"])
-@require_auth
+@login_required
 def api_file_delete():
     data = request.get_json() or {}
     rel = data.get("path", "").strip("/")
@@ -469,7 +471,7 @@ def api_file_delete():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/file/upload", methods=["POST"])
-@require_auth
+@login_required
 def api_file_upload():
     if "file" not in request.files:
         return jsonify({"error": "Không có file"}), 400
@@ -488,7 +490,7 @@ def api_file_upload():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/file/new", methods=["POST"])
-@require_auth
+@login_required
 def api_file_new():
     data = request.get_json() or {}
     rel = data.get("path", "").strip("/")
@@ -514,6 +516,39 @@ if __name__ == "__main__":
     app.run(host=WEB_BIND, port=WEB_PORT, debug=False)
 PY
 
+# ====================== login.html ======================
+cat > templates/login.html << 'HTML'
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Đăng nhập - MC Control</title>
+<style>
+body{margin:0;font-family:system-ui,sans-serif;background:#0c0c0f;color:#e4e4e7;display:flex;justify-content:center;align-items:center;min-height:100vh}
+.card{background:#16161a;border:1px solid #2a2a32;border-radius:16px;padding:32px;width:100%;max-width:360px;box-shadow:0 10px 40px rgba(0,0,0,.4)}
+h1{text-align:center;margin:0 0 24px;font-size:1.5rem}
+input{width:100%;padding:12px 14px;margin-bottom:14px;border-radius:10px;border:1px solid #2a2a32;background:#0f0f12;color:#e4e4e7;font-size:1rem;outline:none}
+input:focus{border-color:#4ade80}
+button{width:100%;padding:12px;border:none;border-radius:10px;background:#4ade80;color:#052e16;font-weight:700;font-size:1rem;cursor:pointer}
+button:active{transform:scale(.98)}
+.error{background:rgba(248,113,113,.15);color:#f87171;padding:10px;border-radius:8px;margin-bottom:14px;text-align:center;font-size:.9rem}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>⛏ MC Server</h1>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="POST">
+    <input type="text" name="username" placeholder="Tài khoản" required autofocus>
+    <input type="password" name="password" placeholder="Mật khẩu" required>
+    <button type="submit">Đăng nhập</button>
+  </form>
+</div>
+</body>
+</html>
+HTML
+
 # ====================== index.html ======================
 cat > templates/index.html << 'HTML'
 <!DOCTYPE html>
@@ -532,6 +567,7 @@ h1{font-size:1.4rem}
 .badge{padding:4px 12px;border-radius:99px;font-size:.85rem;font-weight:600}
 .online{background:rgba(74,222,128,.15);color:var(--accent)}
 .offline{background:rgba(248,113,113,.15);color:var(--danger)}
+.logout{background:#27272a;color:var(--text);border:1px solid var(--border);padding:6px 12px;border-radius:8px;text-decoration:none;font-size:.85rem}
 .tabs{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
 .tab{padding:8px 14px;border-radius:10px;background:#27272a;border:none;color:var(--text);cursor:pointer;font-weight:600}
 .tab.active{background:var(--accent);color:#052e16}
@@ -555,7 +591,7 @@ button{border:none;border-radius:10px;padding:9px 14px;font-weight:600;cursor:po
 .addr code{font-family:monospace;font-size:.9rem;word-break:break-all}
 #log{background:#0a0a0c;border:1px solid var(--border);border-radius:10px;height:280px;overflow:auto;padding:10px;font-family:monospace;font-size:.8rem;white-space:pre-wrap;color:#d4d4d8}
 .cmd-form{display:flex;gap:8px;margin-top:10px}
-.cmd-form input,.file-input{flex:1;background:#0f0f12;border:1px solid var(--border);border-radius:10px;padding:11px;color:var(--text);outline:none}
+.cmd-form input{flex:1;background:#0f0f12;border:1px solid var(--border);border-radius:10px;padding:11px;color:var(--text);outline:none}
 .cmd-form button{background:var(--accent);color:#052e16;padding:0 18px}
 .player-item{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)}
 .file-list{max-height:320px;overflow:auto}
@@ -573,7 +609,10 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;margin-top:20px}
 <div class="container">
   <header>
     <h1>⛏ MC Server Control</h1>
-    <div id="badge" class="badge offline">● Offline</div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <div id="badge" class="badge offline">● Offline</div>
+      <a href="/logout" class="logout">Đăng xuất</a>
+    </div>
   </header>
 
   <div class="tabs">
@@ -584,7 +623,6 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;margin-top:20px}
     <button class="tab" onclick="showTab('settings')">Cài đặt</button>
   </div>
 
-  <!-- DASHBOARD -->
   <div id="dash" class="panel active">
     <div class="grid">
       <div class="card">
@@ -616,7 +654,6 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;margin-top:20px}
     </div>
   </div>
 
-  <!-- PLAYERS -->
   <div id="players" class="panel">
     <div class="card">
       <h3>Người chơi online: <span id="pCount">0</span></h3>
@@ -629,7 +666,6 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;margin-top:20px}
     </div>
   </div>
 
-  <!-- CONSOLE -->
   <div id="console" class="panel">
     <div class="card">
       <h3>Console / Log</h3>
@@ -641,7 +677,6 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;margin-top:20px}
     </div>
   </div>
 
-  <!-- FILES -->
   <div id="files" class="panel">
     <div class="card">
       <h3>Quản lý File — <span id="curPath">/</span></h3>
@@ -656,17 +691,15 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;margin-top:20px}
       </div>
       <div class="file-list" id="fileList"></div>
     </div>
-    <div class="card" style="margin-top:14px" id="editorCard">
+    <div class="card" style="margin-top:14px">
       <h3>Editor — <span id="editPath">Chưa chọn file</span></h3>
       <textarea id="editor" placeholder="Chọn file để xem / sửa..."></textarea>
       <div style="margin-top:10px">
         <button class="btn-start" onclick="saveFile()">💾 Lưu</button>
-        <button class="btn-sm" onclick="document.getElementById('editor').value=''">Xóa nội dung</button>
       </div>
     </div>
   </div>
 
-  <!-- SETTINGS -->
   <div id="settings" class="panel">
     <div class="card">
       <h3>Cài đặt Server</h3>
@@ -675,7 +708,6 @@ footer{text-align:center;color:var(--muted);font-size:.8rem;margin-top:20px}
         <input id="maxP" type="number" min="1" max="200" value="20" style="width:90px;background:#0f0f12;border:1px solid var(--border);border-radius:10px;padding:10px;color:var(--text)">
         <button class="btn-start" onclick="setMax()">Lưu & Restart</button>
       </div>
-      <p style="margin-top:10px;font-size:.85rem;color:var(--muted)">Thay đổi sẽ restart server để áp dụng.</p>
     </div>
   </div>
 
@@ -763,7 +795,6 @@ async function setMax(){
   toast(j.message||j.error);
 }
 
-// ===== FILE MANAGER =====
 async function loadFiles(path){
   currentPath=path||'';
   document.getElementById('curPath').textContent='/'+(currentPath||'');
@@ -856,7 +887,7 @@ export WEB_PORT="$WEB_PORT"
 export MC_PORT="$MC_PORT"
 export BEDROCK_PORT="$BEDROCK_PORT"
 
-echo "==> Khởi động server..."
+echo "==> Khởi động Minecraft server..."
 nohup bash ./run.sh >/dev/null 2>&1 &
 echo $! > mcserver.pid
 sleep 2
@@ -870,10 +901,12 @@ echo ""
 echo "=============================================="
 echo "  CÀI ĐẶT HOÀN TẤT"
 echo "=============================================="
-echo "Java     : ${IP}:${MC_PORT}"
-echo "Bedrock  : ${IP}:${BEDROCK_PORT}"
-echo "Web UI   : http://${IP}:${WEB_PORT}"
-echo "User     : ${ADMIN_USER}"
-echo "Pass     : ${ADMIN_PASS}"
-echo "RCON     : ${RCON_PASS}"
+echo "Java      : ${IP}:${MC_PORT}"
+echo "Bedrock   : ${IP}:${BEDROCK_PORT}"
+echo "Web UI    : http://${IP}:${WEB_PORT}"
+echo "Tài khoản : ${ADMIN_USER}"
+echo "Mật khẩu  : ${ADMIN_PASS}"
+echo "RCON Pass : ${RCON_PASS}"
+echo "=============================================="
+echo "Đăng nhập 1 lần là nhớ, không bị hỏi lại khi load trang."
 echo "=============================================="
